@@ -1,0 +1,125 @@
+name: Generate a mariadb-docs PR on changed plugin API docs
+
+on:
+  workflow_dispatch:  # Manual trigger via Actions tab
+  release:
+    types: [published]  # Triggered when a new release is published
+
+jobs:
+  update-gitbook-docs:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    container:
+      image: quay.io/mariadb-foundation/bb-ecosystem:mariadb-doc-gen
+
+    steps:
+      - name: Checkout mariadb-server
+        uses: actions/checkout@v6
+        with:
+          path: mariadb-server
+
+      - name: Generate documentation
+        id: generate-docs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory `pwd`
+          git submodule update --init --recursive libmariadb
+          
+          # store the MariaDB server versios
+          cat VERSION >> $GITHUB_ENV
+
+          mkdir bld
+          cd bld
+          cmake -DENABLE_GCOV=OFF \
+                -DMYSQL_MAINTAINER_MODE=OFF \
+                -DPLUGIN_ARCHIVE=NO \
+                -DPLUGIN_MROONGA=NO \
+                -DPLUGIN_CONNECT=NO \
+                -DPLUGIN_SPIDER=NO \
+                -DPLUGIN_ROCKSDB=NO \
+                -DPLUGIN_OQGRAPH=NO \
+                -DPLUGIN_TOKUDB=NO \
+                -DWITH_MARIABACKUP=NO \
+                -DWITH_EMBEDDED_SERVER=OFF \
+                -DWITH_UNIT_TESTS=OFF \
+                -DCONC_WITH_UNITTEST=OFF \
+                -DWITH_WSREP=OFF \
+                -DWITHOUT_DYNAMIC_PLUGINS=0 \
+                -DWITH_SSL=system \
+                -DWITH_PCRE=system \
+                -DWITHOUT_SERVER=ON \
+                -DUPDATE_SUBMODULES=OFF \
+                -DWITH_GENERATED_DOCS=YES \
+                ..
+          cmake --build . --target=generated_docs_plugin_api
+          
+      - name: Fork and checkout mariadb-docs
+        run: |
+          # Configure git
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Fork the repository if not already forked
+          gh repo fork mariadb-corporation/mariadb-docs --clone=false --remote=false || true
+
+          # Clone the fork
+          gh repo clone mariadb-docs
+          cd mariadb-docs
+
+          git fetch upstream
+
+          # Sync fork with upstream main
+          git checkout main
+          git reset --hard upstream/main
+          git push origin main --force
+
+      - name: Create new branch in mariadb-docs
+        id: create-branch
+        working-directory: mariadb-docs
+        run: |
+          BRANCH_NAME="update-mariadb-server-plugin-api-docs-v${{ steps.generate-docs.outputs.MYSQL_VERSION_MAJOR }}-${{ steps.generate-docs.outputs.MYSQL_VERSION_MINOR }}-${{ steps.generate-docs.outputs.MYSQL_VERSION_PATCH }}"
+          git checkout -b "$BRANCH_NAME"
+          echo "branch=$BRANCH_NAME" >> $GITHUB_ENV
+
+      - name: Update documentation files
+        run: |
+          TARGET_DIR="mariadb-docs/server/reference/plugins"
+
+          # Remove old markdown files (keep directory structure)
+          rm -f "$TARGET_DIR"/plugin_api.md
+
+          # Copy generated markdown file
+          cp mariadb-server/bld/docs/plugin_api/md/plugin_api.md "$TARGET_DIR/"
+
+          echo "Updated files:"
+          ls -lh "$TARGET_DIR/plugin_api.md"
+
+      - name: Commit and push changes
+        id: commit-and-push
+        working-directory: mariadb-docs
+        run: |
+          TARGET_DIR="server/reference/plugins"
+          git add "$TARGET_DIR"/plugin_api.md
+
+          if git diff --staged --quiet; then
+            echo "No documentation changes to commit"
+            echo "has_changes=false" >> $GITHUB_ENV
+          else
+            git commit -m "Update MariaDB Server Plugin API docs to v${{ steps.generate-docs.outputs.MYSQL_VERSION_MAJOR }}-${{ steps.generate-docs.outputs.MYSQL_VERSION_MINOR }}-${{ steps.generate-docs.outputs.MYSQL_VERSION_PATCH }}"
+            echo git push origin "${{ steps.create-branch.outputs.branch }}"
+            echo "has_changes=true" >> $GITHUB_ENV
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Workflow Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Package version:** v${{ steps.generate-docs.outputs.MYSQL_VERSION_MAJOR }}-${{ steps.generate-docs.outputs.MYSQL_VERSION_MINOR }}-${{ steps.generate-docs.outputs.MYSQL_VERSION_PATCH }} >> $GITHUB_STEP_SUMMARY
+          echo "- **Changes detected:** ${{ steps.commit-and-push.outputs.has_changes }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.commit-and-push.outputs.has_changes }}" = "true" ]; then
+            echo "- **Branch:** ${{ steps.create-branch.outputs.branch }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Status:** ✅ PR created in mariadb-corporation/mariadb-docs" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Status:** ℹ️ No changes to commit" >> $GITHUB_STEP_SUMMARY
+          fi
